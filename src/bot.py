@@ -11,8 +11,10 @@ from telethon.events import NewMessage, StopPropagation
 from telethon.tl.custom import Message
 
 from utils import download_files, add_to_zip
+from web import start
 
 load_dotenv()
+start()
 
 API_ID = os.environ['API_ID']
 API_HASH = os.environ['API_HASH']
