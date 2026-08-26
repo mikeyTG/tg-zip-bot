@@ -1,17 +1,14 @@
-from functools import partial
-from asyncio import get_running_loop
-from shutil import rmtree
-from pathlib import Path
+import asyncio
 import logging
 import os
 import re
+import shutil
+import zipfile
+from pathlib import Path
 
 from dotenv import load_dotenv
-from telethon import TelegramClient
-from telethon.events import NewMessage, StopPropagation
-
-from utils import download_files, add_to_zip
-from web import start
+from telethon import TelegramClient, events
+from telethon.events import StopPropagation
 
 
 # ============================================================
@@ -19,13 +16,10 @@ from web import start
 # ============================================================
 
 load_dotenv()
-start()
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-
-CONC_MAX = int(os.environ.get("CONC_MAX", 3))
 
 STORAGE = Path("./files")
 STORAGE.mkdir(parents=True, exist_ok=True)
@@ -38,20 +32,9 @@ STORAGE.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     format="[%(levelname)s/%(asctime)s] %(name)s: %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler()
-    ],
 )
 
 logger = logging.getLogger("ZipBot")
-
-
-# ============================================================
-# TASK STORAGE
-# ============================================================
-
-# user_id -> list of Telegram message IDs
-tasks: dict[int, list[int]] = {}
 
 
 # ============================================================
@@ -60,44 +43,145 @@ tasks: dict[int, list[int]] = {}
 
 bot = TelegramClient(
     "quick-zip-bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
+    API_ID,
+    API_HASH,
 ).start(
     bot_token=BOT_TOKEN
 )
 
 
 # ============================================================
-# /START + /HELP
+# USER TASKS
+# ============================================================
+
+# user_id -> list of message IDs
+tasks = {}
+
+# users currently creating a ZIP
+busy_users = set()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_filename(name):
+    """
+    Make a Telegram filename safe for the filesystem.
+    """
+
+    if not name:
+        name = "file"
+
+    name = os.path.basename(name)
+
+    name = re.sub(
+        r'[<>:"/\\|?*\x00-\x1f]',
+        "_",
+        name,
+    )
+
+    return name[:240]
+
+
+def format_mb(value):
+    return f"{value / (1024 * 1024):.2f} MB"
+
+
+def cleanup_user(user_id):
+
+    folder = STORAGE / str(user_id)
+
+    try:
+        if folder.exists():
+            shutil.rmtree(folder)
+
+    except Exception:
+        logger.exception(
+            "Failed to clean user directory: %s",
+            user_id,
+        )
+
+
+# ============================================================
+# /START
 # ============================================================
 
 @bot.on(
-    NewMessage(
-        pattern=r"^/(start|help)(?:@\w+)?$"
+    events.NewMessage(
+        pattern=r"^/start(?:@\w+)?$"
     )
 )
 async def start_handler(event):
 
+    user_id = event.sender_id
+
+    if user_id in busy_users:
+
+        await event.respond(
+            "⏳ <b>I'm still processing your ZIP.</b>\n\n"
+            "Please wait until it finishes before using /start.",
+            parse_mode="html",
+        )
+
+        raise StopPropagation
+
     await event.respond(
         "👋 <b>Welcome to ZipBot!</b>\n\n"
-        "📦 I can collect your Telegram files "
-        "and turn them into a ZIP.\n\n"
+        "📦 Send me Telegram files and I'll turn them "
+        "into a ZIP.\n\n"
 
         "<b>Commands:</b>\n"
         "➕ /add — start collecting files\n"
-        "📦 /zip filename — create the ZIP\n"
+        "📦 /zip filename — create ZIP\n"
         "🗑 /del__ID — remove a file\n"
-        "❌ /cancel — cancel the current task\n"
-        "ℹ️ /help — show this help\n\n"
+        "❌ /cancel — cancel current task\n"
+        "ℹ️ /help — show help\n\n"
 
-        "<b>How to use:</b>\n"
-        "1️⃣ Send <code>/add</code>\n"
-        "2️⃣ Send your files\n"
-        "3️⃣ Use the provided <code>/del__ID</code> "
-        "to remove unwanted files\n"
-        "4️⃣ Send <code>/zip myfiles</code>\n\n"
+        "<b>Example:</b>\n"
+        "1. /add\n"
+        "2. Send files\n"
+        "3. Remove unwanted files with /del__ID\n"
+        "4. /zip myfiles",
+        parse_mode="html",
+    )
 
-        "📊 I'll show ZIP processing and upload progress.",
+    raise StopPropagation
+
+
+# ============================================================
+# /HELP
+# ============================================================
+
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/help(?:@\w+)?$"
+    )
+)
+async def help_handler(event):
+
+    await event.respond(
+        "📦 <b>ZipBot Help</b>\n\n"
+
+        "➕ <code>/add</code>\n"
+        "Start a new file collection.\n\n"
+
+        "📦 <code>/zip filename</code>\n"
+        "Download the selected files, create a ZIP, "
+        "and upload it.\n\n"
+
+        "🗑 <code>/del__MESSAGE_ID</code>\n"
+        "Remove one file from the current ZIP list.\n\n"
+
+        "❌ <code>/cancel</code>\n"
+        "Cancel the current collection.\n\n"
+
+        "📊 During ZIP creation you'll see:\n"
+        "• Download percentage\n"
+        "• MB downloaded\n"
+        "• ZIP processing status\n"
+        "• Upload percentage\n"
+        "• MB uploaded",
         parse_mode="html",
     )
 
@@ -109,39 +193,35 @@ async def start_handler(event):
 # ============================================================
 
 @bot.on(
-    NewMessage(
+    events.NewMessage(
         pattern=r"^/add(?:@\w+)?$"
     )
 )
-async def start_task_handler(event):
+async def add_handler(event):
 
     user_id = event.sender_id
 
-    # Start a completely new task.
+    if user_id in busy_users:
+
+        await event.respond(
+            "⏳ Your previous ZIP is still processing.\n"
+            "Please wait for it to finish."
+        )
+
+        raise StopPropagation
+
+    # Start fresh task.
     tasks[user_id] = []
 
-    # Clean any old temporary files.
-    user_root = STORAGE / str(user_id)
-
-    try:
-
-        if user_root.exists():
-            rmtree(user_root)
-
-    except Exception:
-
-        logger.exception(
-            "Failed to clean old files for user %s",
-            user_id,
-        )
+    cleanup_user(user_id)
 
     await event.respond(
         "OK, send me some files.\n\n"
-        "I'll give you a delete command for each file."
+        "I'll give you a delete command for every file."
     )
 
     logger.info(
-        "User %s started a new ZIP task",
+        "User %s started a new task",
         user_id,
     )
 
@@ -149,93 +229,100 @@ async def start_task_handler(event):
 
 
 # ============================================================
-# DELETE ONE FILE
+# DELETE FILE
 # ============================================================
 
 @bot.on(
-    NewMessage(
-        pattern=r"^/del__(?P<message_id>\d+)$"
+    events.NewMessage(
+        pattern=r"^/del__(\d+)$"
     )
 )
-async def delete_file_handler(event):
+async def delete_handler(event):
 
     user_id = event.sender_id
 
-    # No active task.
+    if user_id in busy_users:
+
+        await event.respond(
+            "⏳ The ZIP is already being processed.\n"
+            "You can't remove files right now."
+        )
+
+        raise StopPropagation
+
     if user_id not in tasks:
 
         await event.respond(
-            "❌ You don't have an active file list.\n"
+            "❌ No active file list.\n"
             "Use /add first."
         )
 
         raise StopPropagation
 
     message_id = int(
-        event.pattern_match["message_id"]
+        event.pattern_match.group(1)
     )
 
-    # Check whether the message is in the ZIP queue.
     if message_id not in tasks[user_id]:
 
         await event.respond(
-            "❌ That file isn't in your current ZIP list.\n"
-            "It may already have been removed."
+            "❌ That file isn't in your current list."
         )
 
         raise StopPropagation
 
-    # Remove the message ID from the queue.
     tasks[user_id].remove(message_id)
 
-    remaining = len(tasks[user_id])
+    remaining = len(
+        tasks[user_id]
+    )
 
     await event.respond(
         "🗑 <b>File removed.</b>\n\n"
-        f"📁 Files remaining: <b>{remaining}</b>",
+        f"📁 Remaining: <b>{remaining}</b>",
         parse_mode="html",
-    )
-
-    logger.info(
-        "User %s removed message %s",
-        user_id,
-        message_id,
     )
 
     raise StopPropagation
 
 
 # ============================================================
-# FILE HANDLER
+# FILE COLLECTOR
 # ============================================================
 
 @bot.on(
-    NewMessage(
-        func=lambda e: (
-            e.sender_id in tasks
-            and e.file is not None
+    events.NewMessage(
+        func=lambda event: (
+            event.sender_id in tasks
+            and event.file is not None
         )
     )
 )
-async def add_file_handler(event):
+async def file_handler(event):
 
     user_id = event.sender_id
+
+    if user_id in busy_users:
+        return
 
     if user_id not in tasks:
         return
 
-    # Don't add the same message twice.
     if event.id not in tasks[user_id]:
 
-        tasks[user_id].append(event.id)
+        tasks[user_id].append(
+            event.id
+        )
 
-    # Get filename.
     filename = (
-        getattr(event.file, "name", None)
+        getattr(
+            event.file,
+            "name",
+            None,
+        )
         or "unnamed file"
     )
 
-    # Tell user how to delete this file.
     await event.respond(
         f"✅ <b>added</b> {filename}\n\n"
         f"delete using <code>/del__{event.id}</code>",
@@ -243,10 +330,8 @@ async def add_file_handler(event):
     )
 
     logger.info(
-        "Added file '%s' "
-        "(message %s) for user %s",
+        "Added %s for user %s",
         filename,
-        event.id,
         user_id,
     )
 
@@ -258,8 +343,8 @@ async def add_file_handler(event):
 # ============================================================
 
 @bot.on(
-    NewMessage(
-        pattern=r"^/zip(?:@\w+)?\s+(?P<name>[\w.-]+)$"
+    events.NewMessage(
+        pattern=r"^/zip(?:@\w+)?(?:\s+(.+))?$"
     )
 )
 async def zip_handler(event):
@@ -267,13 +352,27 @@ async def zip_handler(event):
     user_id = event.sender_id
 
     # --------------------------------------------------------
-    # Check active task
+    # Prevent duplicate ZIP jobs
+    # --------------------------------------------------------
+
+    if user_id in busy_users:
+
+        await event.respond(
+            "⏳ <b>A ZIP is already processing.</b>\n\n"
+            "Please wait for it to finish.",
+            parse_mode="html",
+        )
+
+        raise StopPropagation
+
+    # --------------------------------------------------------
+    # Check task
     # --------------------------------------------------------
 
     if user_id not in tasks:
 
         await event.respond(
-            "❌ You must use /add first."
+            "❌ Use /add first."
         )
 
         raise StopPropagation
@@ -281,48 +380,68 @@ async def zip_handler(event):
     if not tasks[user_id]:
 
         await event.respond(
-            "❌ You haven't added any files yet.\n"
-            "Use /add and send some files."
+            "❌ No files have been added yet."
         )
 
         raise StopPropagation
 
     # --------------------------------------------------------
-    # Get ZIP name
+    # ZIP NAME
     # --------------------------------------------------------
 
-    zip_name_input = event.pattern_match["name"]
+    requested_name = event.pattern_match.group(1)
 
-    # Keep the ZIP filename safe.
-    zip_name_input = re.sub(
+    if requested_name:
+
+        requested_name = requested_name.strip()
+
+    else:
+
+        requested_name = "archive"
+
+    requested_name = re.sub(
         r"[^a-zA-Z0-9_.-]",
         "_",
-        zip_name_input,
+        requested_name,
     )
 
-    if not zip_name_input:
-        zip_name_input = "archive"
+    if not requested_name:
+
+        requested_name = "archive"
+
+    # --------------------------------------------------------
+    # Mark user busy
+    # --------------------------------------------------------
+
+    busy_users.add(user_id)
 
     root = STORAGE / str(user_id)
-
-    zip_name = root / f"{zip_name_input}.zip"
 
     root.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    status_message = None
+    zip_path = (
+        root
+        / f"{requested_name}.zip"
+    )
+
+    status = None
 
     try:
 
         # ====================================================
-        # GET SELECTED TELEGRAM MESSAGES
+        # GET TELEGRAM MESSAGES
         # ====================================================
+
+        message_ids = list(
+            tasks[user_id]
+        )
 
         messages = await bot.get_messages(
             user_id,
-            ids=tasks[user_id],
+            ids=message_ids,
         )
 
         messages = [
@@ -335,175 +454,256 @@ async def zip_handler(event):
         if not messages:
 
             await event.respond(
-                "❌ I couldn't find the selected files anymore."
+                "❌ I couldn't find your files."
             )
 
             return
 
         # ====================================================
-        # CALCULATE TOTAL SIZE
+        # TOTAL SIZE
         # ====================================================
 
-        total_size = sum(
+        total_bytes = sum(
             message.file.size or 0
             for message in messages
         )
 
-        max_size = 2 * 1024 * 1024 * 1024
-
-        if total_size > max_size:
-
-            total_gb = (
-                total_size
-                / (1024 * 1024 * 1024)
-            )
-
-            await event.respond(
-                "❌ The selected files are too large.\n\n"
-                f"📦 Total: <b>{total_gb:.2f} GB</b>\n"
-                "📦 Maximum: <b>2 GB</b>\n\n"
-                "Remove some files using /del__ID."
-                ,
-                parse_mode="html",
-            )
-
-            return
-
         total_mb = (
-            total_size
+            total_bytes
             / (1024 * 1024)
         )
 
-        # ====================================================
-        # INITIAL STATUS
-        # ====================================================
-
-        status_message = await event.respond(
-            "📥 <b>Preparing files...</b>\n\n"
+        status = await event.respond(
+            "📥 <b>Downloading files...</b>\n\n"
             f"📦 Total: <b>{total_mb:.2f} MB</b>\n"
-            "📊 Progress: <b>0%</b>\n"
-            f"📁 Files: <b>0/{len(messages)}</b>",
+            "📊 <b>0%</b>\n"
+            f"📁 0/{len(messages)} files",
             parse_mode="html",
         )
 
         # ====================================================
-        # PROCESS FILES
+        # DOWNLOAD FILES
         # ====================================================
 
-        processed_bytes = 0
-        processed_files = 0
+        downloaded_bytes = 0
 
-        async for file_path in download_files(
+        # Used to avoid Telegram message edit spam.
+        last_percent = -1
+
+        for index, message in enumerate(
             messages,
-            CONC_MAX,
-            root,
+            start=1,
         ):
 
-            if file_path is None:
-                continue
+            original_name = (
+                getattr(
+                    message.file,
+                    "name",
+                    None,
+                )
+                or f"file_{message.id}"
+            )
 
-            # -----------------------------------------------
-            # Get actual downloaded file size
-            # -----------------------------------------------
+            filename = safe_filename(
+                original_name
+            )
 
-            try:
+            output_path = (
+                root / filename
+            )
 
-                file_size = file_path.stat().st_size
+            # Avoid overwriting duplicate names.
+            if output_path.exists():
 
-            except Exception:
+                stem = output_path.stem
+                suffix = output_path.suffix
 
-                file_size = 0
+                counter = 2
 
-            processed_bytes += file_size
-            processed_files += 1
+                while output_path.exists():
 
-            processed_mb = (
-                processed_bytes
-                / (1024 * 1024)
+                    output_path = (
+                        root
+                        / f"{stem}_{counter}"
+                        f"{suffix}"
+                    )
+
+                    counter += 1
+
+            file_size = (
+                message.file.size or 0
             )
 
             # -----------------------------------------------
-            # Calculate percentage
+            # Download progress callback
             # -----------------------------------------------
 
-            if total_size > 0:
+            async def download_progress(
+                current,
+                total,
+                message_index=index,
+                already_downloaded=downloaded_bytes,
+            ):
 
-                percent = int(
-                    processed_bytes
-                    * 100
-                    / total_size
+                nonlocal last_percent
+
+                actual_total = (
+                    total_bytes
+                    if total_bytes > 0
+                    else total
                 )
 
-                percent = min(
-                    percent,
-                    100,
+                current_total = (
+                    already_downloaded
+                    + current
+                )
+
+                if actual_total > 0:
+
+                    percent = int(
+                        current_total
+                        * 100
+                        / actual_total
+                    )
+
+                    percent = min(
+                        percent,
+                        100,
+                    )
+
+                else:
+
+                    percent = 0
+
+                # Update every 2%.
+                if (
+                    percent != last_percent
+                    and (
+                        percent % 2 == 0
+                        or percent >= 100
+                    )
+                ):
+
+                    last_percent = percent
+
+                    current_mb = (
+                        current_total
+                        / (1024 * 1024)
+                    )
+
+                    try:
+
+                        await status.edit(
+                            "📥 <b>Downloading files...</b>\n\n"
+                            f"📊 <b>{percent}%</b>\n"
+                            f"💾 {current_mb:.2f} MB / "
+                            f"{total_mb:.2f} MB\n"
+                            f"📁 File {message_index}/"
+                            f"{len(messages)}\n"
+                            f"📄 {filename}",
+                            parse_mode="html",
+                        )
+
+                    except Exception:
+                        pass
+
+            # -----------------------------------------------
+            # Actual Telegram download
+            # -----------------------------------------------
+
+            logger.info(
+                "Downloading %s/%s: %s",
+                index,
+                len(messages),
+                filename,
+            )
+
+            await message.download_media(
+                file=str(output_path),
+                progress_callback=download_progress,
+            )
+
+            # -----------------------------------------------
+            # Get actual downloaded size
+            # -----------------------------------------------
+
+            if output_path.exists():
+
+                actual_size = (
+                    output_path.stat().st_size
                 )
 
             else:
 
-                percent = 100
+                actual_size = file_size
 
-            # -----------------------------------------------
-            # Log progress
-            # -----------------------------------------------
+            downloaded_bytes += actual_size
 
             logger.info(
-                "Processing user %s: "
-                "%s/%s files, "
-                "%.2f MB / %.2f MB (%s%%)",
-                user_id,
-                processed_files,
+                "Downloaded %s/%s: %s",
+                index,
                 len(messages),
-                processed_mb,
-                total_mb,
-                percent,
+                filename,
             )
 
-            # -----------------------------------------------
-            # Add file to ZIP
-            # -----------------------------------------------
+        # ====================================================
+        # ZIP CREATION
+        # ====================================================
 
-            await get_running_loop().run_in_executor(
-                None,
-                partial(
-                    add_to_zip,
-                    zip_name,
+        await status.edit(
+            "📦 <b>Creating ZIP...</b>\n\n"
+            f"💾 {downloaded_bytes / (1024 * 1024):.2f} MB "
+            f"processed\n"
+            f"📁 {len(messages)}/{len(messages)} files",
+            parse_mode="html",
+        )
+
+        # IMPORTANT:
+        # MKV/MP4 files are already compressed.
+        # ZIP_DEFLATED wastes CPU and time.
+        # ZIP_STORED makes ZIP creation much faster.
+
+        files_to_zip = [
+            path
+            for path in root.iterdir()
+            if path.is_file()
+            and path != zip_path
+        ]
+
+        with zipfile.ZipFile(
+            zip_path,
+            "w",
+            compression=zipfile.ZIP_STORED,
+        ) as archive:
+
+            for index, file_path in enumerate(
+                files_to_zip,
+                start=1,
+            ):
+
+                archive.write(
                     file_path,
-                ),
-            )
-
-            # -----------------------------------------------
-            # Update Telegram status
-            # -----------------------------------------------
-
-            try:
-
-                await status_message.edit(
-                    "📦 <b>Processing ZIP...</b>\n\n"
-                    f"📊 <b>{percent}%</b>\n"
-                    f"💾 {processed_mb:.2f} MB / "
-                    f"{total_mb:.2f} MB\n"
-                    f"📁 {processed_files}/"
-                    f"{len(messages)} files",
-                    parse_mode="html",
+                    arcname=file_path.name,
                 )
 
-            except Exception:
+                try:
 
-                # Ignore Telegram edit errors.
-                pass
+                    await status.edit(
+                        "📦 <b>Creating ZIP...</b>\n\n"
+                        f"📊 <b>{int(index * 100 / len(files_to_zip))}%</b>\n"
+                        f"📁 {index}/{len(files_to_zip)} files\n"
+                        f"💾 {file_path.stat().st_size / (1024 * 1024):.2f} MB",
+                        parse_mode="html",
+                    )
+
+                except Exception:
+                    pass
 
         # ====================================================
-        # VERIFY ZIP
+        # ZIP SIZE
         # ====================================================
 
-        if not zip_name.exists():
-
-            raise RuntimeError(
-                "ZIP file was not created."
-            )
-
-        zip_size = zip_name.stat().st_size
+        zip_size = zip_path.stat().st_size
 
         zip_mb = (
             zip_size
@@ -511,47 +711,34 @@ async def zip_handler(event):
         )
 
         logger.info(
-            "ZIP created for user %s: %.2f MB",
-            user_id,
+            "ZIP created: %.2f MB",
             zip_mb,
         )
 
         # ====================================================
-        # UPLOAD PROGRESS
+        # UPLOAD
         # ====================================================
 
-        await status_message.edit(
+        await status.edit(
             "📤 <b>Uploading ZIP...</b>\n\n"
-            f"💾 {zip_mb:.2f} MB\n"
-            "📊 <b>0%</b>",
+            f"📦 Size: <b>{zip_mb:.2f} MB</b>\n"
+            "📊 <b>0%</b>\n"
+            "💾 0 MB uploaded",
             parse_mode="html",
         )
 
-        last_percent = -1
+        last_upload_percent = -1
 
         async def upload_progress(
             current,
             total,
         ):
 
-            nonlocal last_percent
+            nonlocal last_upload_percent
 
             if total <= 0:
                 return
 
-            # Current uploaded MB.
-            current_mb = (
-                current
-                / (1024 * 1024)
-            )
-
-            # Total upload MB.
-            upload_total_mb = (
-                total
-                / (1024 * 1024)
-            )
-
-            # Real percentage.
             percent = int(
                 current
                 * 100
@@ -563,52 +750,62 @@ async def zip_handler(event):
                 100,
             )
 
-            # Only edit when percentage changes.
-            # This prevents Telegram flood limits.
+            # Update every 2%.
             if (
-                percent != last_percent
-                or percent == 100
+                percent != last_upload_percent
+                and (
+                    percent % 2 == 0
+                    or percent >= 100
+                )
             ):
 
-                last_percent = percent
+                last_upload_percent = percent
+
+                current_mb = (
+                    current
+                    / (1024 * 1024)
+                )
+
+                total_upload_mb = (
+                    total
+                    / (1024 * 1024)
+                )
 
                 try:
 
-                    await status_message.edit(
+                    await status.edit(
                         "📤 <b>Uploading ZIP...</b>\n\n"
                         f"📊 <b>{percent}%</b>\n"
                         f"💾 {current_mb:.2f} MB / "
-                        f"{upload_total_mb:.2f} MB",
+                        f"{total_upload_mb:.2f} MB",
                         parse_mode="html",
                     )
 
                 except Exception:
-
                     pass
 
-        # ====================================================
-        # UPLOAD ZIP
-        # ====================================================
+        # ----------------------------------------------------
+        # ACTUAL UPLOAD
+        # ----------------------------------------------------
 
         await bot.send_file(
             user_id,
-            zip_name,
+            str(zip_path),
             caption=(
                 "✅ <b>ZIP ready!</b>\n\n"
-                f"📦 Size: <b>{zip_mb:.2f} MB</b>\n"
-                "📊 Upload: <b>100%</b>"
+                f"📦 Size: <b>{zip_mb:.2f} MB</b>"
             ),
             parse_mode="html",
             progress_callback=upload_progress,
         )
 
         # ====================================================
-        # COMPLETE
+        # DONE
         # ====================================================
 
         try:
 
-            await status_message.edit(
+            await status.edit(
                 "✅ <b>Upload complete!</b>\n\n"
                 f"📦 ZIP size: <b>{zip_mb:.2f} MB</b>\n"
                 "📊 <b>100%</b>",
@@ -616,194 +813,49 @@ async def zip_handler(event):
             )
 
         except Exception:
-
             pass
 
         logger.info(
-            "ZIP uploaded successfully "
-            "for user %s",
+            "ZIP successfully uploaded for user %s",
             user_id,
         )
-
-    # ========================================================
-    # ERROR HANDLING
-    # ========================================================
 
     except Exception as exc:
 
         logger.exception(
-            "ZIP operation failed "
-            "for user %s",
+            "ZIP failed for user %s",
             user_id,
         )
 
-        error_text = (
-            "❌ <b>Something went wrong.</b>\n\n"
-            f"<code>{type(exc).__name__}</code>"
+        error_message = (
+            "❌ <b>ZIP failed.</b>\n\n"
+            f"Error: <code>{type(exc).__name__}</code>\n\n"
+            "Check the Render logs for the full error."
         )
 
         try:
 
-            if status_message:
+            if status:
 
-                await status_message.edit(
-                    error_text,
+                await status.edit(
+                    error_message,
                     parse_mode="html",
                 )
 
             else:
 
                 await event.respond(
-                    error_text,
+                    error_message,
                     parse_mode="html",
                 )
 
         except Exception:
-
-            logger.exception(
-                "Could not send error message "
-                "to user %s",
-                user_id,
-            )
-
-    # ========================================================
-    # CLEANUP
-    # ========================================================
+            pass
 
     finally:
 
-        try:
-
-            if root.exists():
-                rmtree(root)
-
-        except Exception:
-
-            logger.exception(
-                "Failed to clean temporary files "
-                "for user %s",
-                user_id,
-            )
-
-        # Clear selected files.
-        tasks.pop(
-            user_id,
-            None,
+        busy_users.discard(
+            user_id
         )
 
-    raise StopPropagation
-
-
-# ============================================================
-# /CANCEL
-# ============================================================
-
-@bot.on(
-    NewMessage(
-        pattern=r"^/cancel(?:@\w+)?$"
-    )
-)
-async def cancel_handler(event):
-
-    user_id = event.sender_id
-
-    # Clear task.
-    tasks.pop(
-        user_id,
-        None,
-    )
-
-    # Remove temporary files.
-    user_root = STORAGE / str(user_id)
-
-    try:
-
-        if user_root.exists():
-            rmtree(user_root)
-
-    except Exception:
-
-        logger.exception(
-            "Failed to clean files "
-            "while cancelling user %s",
-            user_id,
-        )
-
-    await event.respond(
-        "❌ Canceled.\n\n"
-        "For a new ZIP, use /add."
-    )
-
-    logger.info(
-        "User %s cancelled their task",
-        user_id,
-    )
-
-    raise StopPropagation
-
-
-# ============================================================
-# START BOT
-# ============================================================
-
-if __name__ == "__main__":
-
-    logger.info(
-        "======================================"
-    )
-
-    logger.info(
-        "Starting ZipBot..."
-    )
-
-    logger.info(
-        "======================================"
-    )
-
-    async def startup_log():
-
-        try:
-
-            account = await bot.get_me()
-
-            logger.info(
-                "Logged in as @%s",
-                getattr(
-                    account,
-                    "username",
-                    None,
-                ),
-            )
-
-            logger.info(
-                "ZipBot is ready and waiting "
-                "for messages."
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Could not retrieve bot information."
-            )
-
-    try:
-
-        bot.loop.run_until_complete(
-            startup_log()
-        )
-
-        bot.run_until_disconnected()
-
-    except KeyboardInterrupt:
-
-        logger.info(
-            "ZipBot stopped."
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Fatal error while running ZipBot."
-        )
-
-        raise
+        tasks.pop
