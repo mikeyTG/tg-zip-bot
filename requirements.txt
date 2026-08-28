@@ -1,4 +1,0 @@
-hydrogram>=0.1.9
-tgcrypto>=1.2.5
-python-dotenv==0.19.2
-aiohttp>=3.9.0
